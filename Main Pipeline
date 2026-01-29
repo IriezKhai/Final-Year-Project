@@ -1,0 +1,924 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
+import optuna
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+import warnings
+import sys
+from typing import Dict, List, Tuple
+
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+np.random.seed(42)
+
+# ==========================================
+# CONFIGURATION - ROLLING WINDOW
+# ==========================================
+CONFIG = {
+    'ohlcv_file': '/kaggle/input/forexjpy/prototypedata.csv',
+    'wave_target_file': '/kaggle/input/fractal/fracdiff_prices.csv',
+    
+    # CRITICAL: Forecast horizon (hours ahead to predict)
+    'forecast_horizon': 24,  # Predict 24 hours (1 day) ahead
+    
+    # Rolling window configuration
+    'rolling_window_size': 10000,
+    'test_window_size': 168,
+    'step_size': 168,
+    'validation_size': 720,
+    
+    # Model configuration - WIDER QUANTILES for better uncertainty
+    'quantiles': [0.05, 0.5, 0.95],
+    'use_optuna': True,  # ENABLED by default
+    'optuna_trials': 50,  # Increased for better tuning
+    'retune_frequency': 4,
+    
+    # Optuna hyperparameter search space (expanded)
+    'optuna_search_space': {
+        'n_estimators': (100, 500),
+        'learning_rate': (0.01, 0.3),
+        'num_leaves': (20, 150),
+        'min_child_samples': (10, 100),
+        'subsample': (0.5, 1.0),
+        'colsample_bytree': (0.5, 1.0),
+        'reg_alpha': (0.0, 10.0),
+        'reg_lambda': (0.0, 10.0),
+        'max_depth': (3, 15),
+        'min_gain_to_split': (0.0, 1.0),
+        'min_child_weight': (1e-5, 1e-1),
+    },
+    
+    # Fixed hyperparameters (fallback)
+    'fixed_params': {
+        'n_estimators': 150,
+        'learning_rate': 0.05,
+        'num_leaves': 31,
+        'min_child_samples': 20,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'reg_alpha': 0.1,
+        'reg_lambda': 0.1,
+        'max_depth': -1,
+        'random_state': 42,
+        'n_jobs': -1,
+        'verbosity': -1
+    }
+}
+
+# ==========================================
+# ENHANCED FEATURE ENGINEERING
+# ==========================================
+def engineer_ohlcv_features_enhanced(df):
+    """
+    Enhanced feature engineering with acceleration and advanced indicators
+    NO DATA LEAKAGE - all features use historical data only
+    """
+    df = df.copy()
+
+    if 'Date' not in df.columns and 'Datetime' in df.columns:
+        df.rename(columns={'Datetime': 'Date'}, inplace=True)
+
+    df['Date'] = pd.to_datetime(df['Date'])
+    df.sort_values('Date', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    feature_cols = []
+
+    # CRITICAL: Shift all price-based features by 1 to avoid leakage
+    
+    # ========== LAGGED PRICES ==========
+    df['Close_lag1'] = df['Close'].shift(1)
+    df['Open_lag1'] = df['Open'].shift(1)
+    df['High_lag1'] = df['High'].shift(1)
+    df['Low_lag1'] = df['Low'].shift(1)
+
+    # ========== BASIC RETURN FEATURES ==========
+    df['Log_Ret_1h'] = np.log(df['Close'].shift(1) / df['Close'].shift(2))
+    df['Simple_Ret_1h'] = df['Close'].shift(1).pct_change()
+
+    # Lagged returns
+    for lag in [1, 2, 3, 6, 12, 24, 48, 72, 168]:
+        col = f'Lag_Ret_{lag}h'
+        df[col] = df['Log_Ret_1h'].shift(lag)
+        feature_cols.append(col)
+
+    # ========== ACCELERATION FEATURES (NEW!) ==========
+    print("   🚀 Adding acceleration features...")
+    
+    # Price velocity (rate of change)
+    for period in [3, 6, 12, 24]:
+        col = f'Price_Velocity_{period}h'
+        df[col] = (df['Close'].shift(1) - df['Close'].shift(period + 1)) / period
+        df[col] = df[col].shift(1)  # Extra shift for no leakage
+        feature_cols.append(col)
+    
+    # Price acceleration (second derivative)
+    for period in [3, 6, 12, 24]:
+        col = f'Price_Acceleration_{period}h'
+        velocity = (df['Close'].shift(1) - df['Close'].shift(period + 1)) / period
+        df[col] = velocity.diff().shift(1)
+        feature_cols.append(col)
+    
+    # Jerk (third derivative) - rate of change of acceleration
+    for period in [6, 12, 24]:
+        col = f'Price_Jerk_{period}h'
+        velocity = (df['Close'].shift(1) - df['Close'].shift(period + 1)) / period
+        acceleration = velocity.diff()
+        df[col] = acceleration.diff().shift(1)
+        feature_cols.append(col)
+    
+    # Return acceleration
+    for period in [6, 12, 24]:
+        col = f'Return_Acceleration_{period}h'
+        df[col] = df['Log_Ret_1h'].diff().rolling(period).mean().shift(1)
+        feature_cols.append(col)
+
+    # ========== VOLATILITY FEATURES ==========
+    for period in [6, 12, 24, 48, 72, 168, 336]:
+        col = f'Vol_{period}h'
+        df[col] = df['Log_Ret_1h'].rolling(period).std().shift(1)
+        feature_cols.append(col)
+
+    # Realized volatility (Parkinson estimator)
+    for period in [12, 24, 48, 168]:
+        col = f'Parkinson_Vol_{period}h'
+        hl_ratio = np.log(df['High'].shift(1) / df['Low'].shift(1))
+        df[col] = np.sqrt((1 / (4 * np.log(2))) * hl_ratio**2).rolling(period).mean().shift(1)
+        feature_cols.append(col)
+    
+    # Volatility acceleration
+    for period in [12, 24]:
+        col = f'Vol_Acceleration_{period}h'
+        vol = df['Log_Ret_1h'].rolling(period).std()
+        df[col] = vol.diff().shift(1)
+        feature_cols.append(col)
+    
+    # Volatility regime detection
+    df['Vol_Regime_24h'] = (df['Log_Ret_1h'].rolling(24).std() > 
+                            df['Log_Ret_1h'].rolling(168).std()).astype(int).shift(1)
+    feature_cols.append('Vol_Regime_24h')
+
+    # ========== PRICE RANGE FEATURES ==========
+    df['High_Low_Range'] = ((df['High'].shift(1) - df['Low'].shift(1)) / 
+                            (df['Close'].shift(1) + 1e-9))
+    df['Close_Open_Ret'] = ((df['Close'].shift(1) - df['Open'].shift(1)) / 
+                           (df['Open'].shift(1) + 1e-9))
+    df['High_Low_Ratio'] = df['High'].shift(1) / (df['Low'].shift(1) + 1e-9)
+    df['Close_to_High'] = ((df['High'].shift(1) - df['Close'].shift(1)) / 
+                          (df['High'].shift(1) - df['Low'].shift(1) + 1e-9))
+    df['Close_to_Low'] = ((df['Close'].shift(1) - df['Low'].shift(1)) / 
+                         (df['High'].shift(1) - df['Low'].shift(1) + 1e-9))
+
+    feature_cols.extend(['High_Low_Range', 'Close_Open_Ret', 'High_Low_Ratio',
+                        'Close_to_High', 'Close_to_Low'])
+
+    # ========== MOVING AVERAGES ==========
+    for period in [12, 24, 48, 168, 336, 720]:
+        col = f'MA_{period}h'
+        df[col] = df['Close'].shift(1).rolling(period).mean()
+        df[f'Dist_MA_{period}h'] = ((df['Close'].shift(1) - df[col]) / 
+                                    (df[col] + 1e-9))
+        feature_cols.extend([col, f'Dist_MA_{period}h'])
+
+    # ========== ADVANCED MOMENTUM INDICATORS (NEW!) ==========
+    print("   📊 Adding advanced momentum indicators...")
+    
+    # Rate of Change (ROC)
+    for period in [6, 12, 24, 48]:
+        col = f'ROC_{period}h'
+        df[col] = ((df['Close'].shift(1) - df['Close'].shift(period + 1)) / 
+                   df['Close'].shift(period + 1)) * 100
+        df[col] = df[col].shift(1)
+        feature_cols.append(col)
+    
+    # Stochastic Oscillator
+    for period in [14, 28]:
+        col_k = f'Stochastic_K_{period}'
+        col_d = f'Stochastic_D_{period}'
+        
+        low_min = df['Low'].shift(1).rolling(period).min()
+        high_max = df['High'].shift(1).rolling(period).max()
+        df[col_k] = ((df['Close'].shift(1) - low_min) / 
+                     (high_max - low_min + 1e-9)) * 100
+        df[col_d] = df[col_k].rolling(3).mean()
+        
+        df[col_k] = df[col_k].shift(1)
+        df[col_d] = df[col_d].shift(1)
+        
+        feature_cols.extend([col_k, col_d])
+    
+    # Williams %R
+    for period in [14, 28]:
+        col = f'Williams_R_{period}'
+        low_min = df['Low'].shift(1).rolling(period).min()
+        high_max = df['High'].shift(1).rolling(period).max()
+        df[col] = ((high_max - df['Close'].shift(1)) / 
+                   (high_max - low_min + 1e-9)) * -100
+        df[col] = df[col].shift(1)
+        feature_cols.append(col)
+    
+    # Commodity Channel Index (CCI)
+    for period in [20, 40]:
+        col = f'CCI_{period}'
+        tp = (df['High'].shift(1) + df['Low'].shift(1) + df['Close'].shift(1)) / 3
+        sma = tp.rolling(period).mean()
+        mad = tp.rolling(period).apply(lambda x: np.abs(x - x.mean()).mean())
+        df[col] = (tp - sma) / (0.015 * mad + 1e-9)
+        df[col] = df[col].shift(1)
+        feature_cols.append(col)
+
+    # ========== RSI ==========
+    for period in [14, 28]:
+        delta = df['Close'].shift(1).diff()
+        gain = delta.where(delta > 0, 0).rolling(period).mean()
+        loss = -delta.where(delta < 0, 0).rolling(period).mean()
+        rs = gain / (loss + 1e-9)
+        df[f'RSI_{period}'] = (100 - (100 / (1 + rs))) / 100.0
+        df[f'RSI_{period}'] = df[f'RSI_{period}'].shift(1)
+        feature_cols.append(f'RSI_{period}')
+
+    # Momentum
+    for period in [6, 12, 24, 48, 168]:
+        col = f'Momentum_{period}h'
+        df[col] = (df['Close'].shift(1) / df['Close'].shift(period + 1)) - 1
+        feature_cols.append(col)
+
+    # MACD components
+    ema_12 = df['Close'].shift(1).ewm(span=12, adjust=False).mean()
+    ema_26 = df['Close'].shift(1).ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema_12 - ema_26
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+    df['MACD'] = df['MACD'].shift(1)
+    df['MACD_Signal'] = df['MACD_Signal'].shift(1)
+    df['MACD_Hist'] = df['MACD_Hist'].shift(1)
+    feature_cols.extend(['MACD', 'MACD_Signal', 'MACD_Hist'])
+
+    # Bollinger Bands
+    for period in [20, 48]:
+        ma = df['Close'].shift(1).rolling(period).mean()
+        std = df['Close'].shift(1).rolling(period).std()
+        df[f'BB_Upper_{period}'] = ma + 2 * std
+        df[f'BB_Lower_{period}'] = ma - 2 * std
+        df[f'BB_Width_{period}'] = ((df[f'BB_Upper_{period}'] - df[f'BB_Lower_{period}']) / 
+                                    (ma + 1e-9))
+        df[f'BB_Position_{period}'] = ((df['Close'].shift(1) - df[f'BB_Lower_{period}']) /
+                                       (df[f'BB_Upper_{period}'] - df[f'BB_Lower_{period}'] + 1e-9))
+        df[f'BB_Width_{period}'] = df[f'BB_Width_{period}'].shift(1)
+        df[f'BB_Position_{period}'] = df[f'BB_Position_{period}'].shift(1)
+        feature_cols.extend([f'BB_Width_{period}', f'BB_Position_{period}'])
+
+    # ========== MARKET MICROSTRUCTURE FEATURES (NEW!) ==========
+    print("   🔬 Adding market microstructure features...")
+    
+    # Bid-Ask spread proxy (High - Low as percentage)
+    for period in [1, 6, 24]:
+        col = f'Spread_Proxy_{period}h'
+        df[col] = ((df['High'] - df['Low']) / df['Close']).rolling(period).mean().shift(1)
+        feature_cols.append(col)
+    
+    # Tick direction (price change direction)
+    df['Tick_Direction'] = np.sign(df['Close'].shift(1) - df['Close'].shift(2))
+    feature_cols.append('Tick_Direction')
+    
+    # Quote imbalance (close position within range)
+    df['Quote_Imbalance'] = ((2 * df['Close'].shift(1) - df['High'].shift(1) - df['Low'].shift(1)) /
+                             (df['High'].shift(1) - df['Low'].shift(1) + 1e-9))
+    df['Quote_Imbalance'] = df['Quote_Imbalance'].shift(1)
+    feature_cols.append('Quote_Imbalance')
+    
+    # Amihud illiquidity measure proxy
+    if 'Volume' in df.columns:
+        for period in [24, 168]:
+            col = f'Amihud_Proxy_{period}h'
+            df[col] = (np.abs(df['Log_Ret_1h']) / 
+                      (df['Volume'].shift(1) + 1e-9)).rolling(period).mean().shift(1)
+            feature_cols.append(col)
+
+    # ========== VOLUME FEATURES ==========
+    if 'Volume' in df.columns:
+        df['Volume_lag1'] = df['Volume'].shift(1)
+        df['Volume_MA_24'] = df['Volume'].shift(1).rolling(24).mean()
+        df['Volume_Ratio'] = df['Volume_lag1'] / (df['Volume_MA_24'] + 1e-9)
+        df['Volume_Std_24'] = df['Volume'].shift(1).rolling(24).std()
+        df['Volume_Ratio'] = df['Volume_Ratio'].shift(1)
+        df['Volume_Std_24'] = df['Volume_Std_24'].shift(1)
+        
+        # Volume acceleration
+        df['Volume_Acceleration'] = df['Volume'].shift(1).diff().diff().shift(1)
+        
+        # On-Balance Volume (OBV)
+        obv = (df['Volume'] * np.sign(df['Close'].diff())).cumsum()
+        df['OBV'] = obv.shift(1)
+        df['OBV_MA_24'] = obv.rolling(24).mean().shift(1)
+        
+        feature_cols.extend(['Volume_Ratio', 'Volume_Std_24', 'Volume_Acceleration', 
+                           'OBV', 'OBV_MA_24'])
+
+    # ========== TIME FEATURES ==========
+    df['Hour'] = df['Date'].dt.hour
+    df['DayOfWeek'] = df['Date'].dt.dayofweek
+    df['Month'] = df['Date'].dt.month
+    df['Hour_Sin'] = np.sin(2 * np.pi * df['Hour'] / 24)
+    df['Hour_Cos'] = np.cos(2 * np.pi * df['Hour'] / 24)
+    df['DOW_Sin'] = np.sin(2 * np.pi * df['DayOfWeek'] / 7)
+    df['DOW_Cos'] = np.cos(2 * np.pi * df['DayOfWeek'] / 7)
+
+    feature_cols.extend(['Hour', 'DayOfWeek', 'Month',
+                        'Hour_Sin', 'Hour_Cos', 'DOW_Sin', 'DOW_Cos'])
+
+    # ========== HIGHER ORDER FEATURES ==========
+    # Skewness and Kurtosis
+    for period in [24, 168]:
+        df[f'Ret_Skew_{period}h'] = df['Log_Ret_1h'].rolling(period).skew().shift(1)
+        df[f'Ret_Kurt_{period}h'] = df['Log_Ret_1h'].rolling(period).kurt().shift(1)
+        feature_cols.extend([f'Ret_Skew_{period}h', f'Ret_Kurt_{period}h'])
+
+    # Autocorrelation
+    for lag in [1, 6, 24]:
+        col = f'Autocorr_Lag_{lag}'
+        df[col] = df['Log_Ret_1h'].rolling(48).apply(
+            lambda x: x.autocorr(lag=lag) if len(x) > lag else np.nan
+        ).shift(1)
+        feature_cols.append(col)
+    
+    # ========== PATTERN FEATURES (NEW!) ==========
+    print("   🎯 Adding pattern recognition features...")
+    
+    # Trend strength
+    for period in [24, 168]:
+        col = f'Trend_Strength_{period}h'
+        returns = df['Close'].shift(1).pct_change()
+        up_days = (returns > 0).rolling(period).sum()
+        df[col] = (up_days / period - 0.5) * 2  # Normalize to [-1, 1]
+        df[col] = df[col].shift(1)
+        feature_cols.append(col)
+    
+    # Price momentum divergence
+    for period in [12, 24]:
+        col = f'Momentum_Divergence_{period}h'
+        price_change = df['Close'].shift(1) - df['Close'].shift(period + 1)
+        volume_change = df['Volume'].shift(1) - df['Volume'].shift(period + 1) if 'Volume' in df.columns else 0
+        df[col] = np.sign(price_change) * np.sign(volume_change) if 'Volume' in df.columns else np.sign(price_change)
+        df[col] = df[col].shift(1)
+        feature_cols.append(col)
+
+    print(f"   ✅ Created {len(feature_cols)} enhanced features")
+    
+    return df, feature_cols
+
+# ==========================================
+# MERGE WITH FUTURE TARGET - NO LEAKAGE
+# ==========================================
+def merge_ohlcv_wave_target_no_leakage(ohlcv_df, wave_df, forecast_horizon):
+    """
+    Merge OHLCV features with FUTURE wave target
+    """
+    
+    if 'Date' not in wave_df.columns and 'Datetime' in wave_df.columns:
+        wave_df.rename(columns={'Datetime': 'Date'}, inplace=True)
+
+    wave_df['Date'] = pd.to_datetime(wave_df['Date'])
+    wave_df.sort_values('Date', inplace=True)
+
+    target_col = [col for col in wave_df.columns if col.lower() not in ['date', 'datetime']][0]
+    print(f"   ✓ Detected target column: '{target_col}'")
+    
+    wave_df['Target_Future'] = wave_df[target_col].shift(-forecast_horizon)
+    print(f"   ✓ Target shifted FORWARD by {forecast_horizon} hours")
+
+    merged_df = pd.merge(ohlcv_df, wave_df[['Date', 'Target_Future']], 
+                        on='Date', how='inner')
+
+    merged_df = merged_df[:-forecast_horizon].copy()
+
+    print(f"   ✓ Merged data: {len(merged_df)} rows")
+    print(f"   ✓ Date range: {merged_df['Date'].min()} to {merged_df['Date'].max()}")
+
+    return merged_df, 'Target_Future'
+
+# ==========================================
+# BASELINE MODELS
+# ==========================================
+class WaveBaselines:
+    
+    @staticmethod
+    def random_walk(n_test):
+        return np.zeros(n_test)
+    
+    @staticmethod
+    def historical_mean(y_train, n_test, window=168):
+        if len(y_train) < window:
+            pred_value = np.mean(y_train) if len(y_train) > 0 else 0.0
+        else:
+            pred_value = np.mean(y_train[-window:])
+        return np.full(n_test, pred_value)
+    
+    @staticmethod
+    def last_value(y_train, n_test):
+        pred_value = y_train[-1] if len(y_train) > 0 else 0.0
+        return np.full(n_test, pred_value)
+    
+    @staticmethod
+    def train_ridge(X_train, y_train, X_test):
+        model = Ridge(alpha=1.0, random_state=42)
+        model.fit(X_train, y_train)
+        return model.predict(X_test)
+    
+    @staticmethod
+    def train_random_forest(X_train, y_train, X_test):
+        model = RandomForestRegressor(
+            n_estimators=100, max_depth=10, random_state=42, n_jobs=-1
+        )
+        model.fit(X_train, y_train)
+        return model.predict(X_test)
+
+# ==========================================
+# STATISTICAL TESTS
+# ==========================================
+class StatisticalTests:
+    
+    @staticmethod
+    def diebold_mariano_test(errors_model, errors_baseline, h=1):
+        loss_diff = errors_model**2 - errors_baseline**2
+        mean_diff = np.mean(loss_diff)
+        
+        def newey_west_var(series, lags):
+            n = len(series)
+            var = np.var(series, ddof=1)
+            for lag in range(1, min(lags + 1, n)):
+                auto_cov = np.cov(series[:-lag], series[lag:])[0, 1]
+                weight = 1 - lag / (lags + 1)
+                var += 2 * weight * auto_cov
+            return var / n
+        
+        variance = newey_west_var(loss_diff, h)
+        dm_stat = mean_diff / np.sqrt(variance + 1e-9)
+        p_value = 2 * (1 - stats.norm.cdf(np.abs(dm_stat)))
+        
+        return {
+            'statistic': dm_stat,
+            'p_value': p_value,
+            'significant': p_value < 0.05,
+            'better': mean_diff < 0
+        }
+    
+    @staticmethod
+    def calculate_picp(y_true, q_lower, q_upper):
+        return np.mean((y_true >= q_lower) & (y_true <= q_upper))
+    
+    @staticmethod
+    def calculate_mpiw(q_lower, q_upper):
+        return np.mean(q_upper - q_lower)
+
+# ==========================================
+# ENHANCED HYPERPARAMETER TUNING WITH OPTUNA
+# ==========================================
+def tune_hyperparameters_optuna(X, y, val_size=None, n_trials=50):
+    """
+    Enhanced Optuna hyperparameter tuning with expanded search space
+    """
+    if val_size is None:
+        val_size = CONFIG['validation_size']
+    
+    if len(X) < val_size + 100:
+        val_size = max(50, int(len(X) * 0.2))
+    
+    split_idx = len(X) - val_size
+    X_train, X_val = X[:split_idx], X[split_idx:]
+    y_train, y_val = y[:split_idx], y[split_idx:]
+    
+    def objective(trial):
+        # Expanded hyperparameter search space
+        params = {
+            'objective': 'quantile',
+            'metric': 'quantile',
+            'alpha': 0.5,
+            'verbosity': -1,
+            'boosting_type': 'gbdt',
+            'n_estimators': trial.suggest_int('n_estimators', 
+                                             *CONFIG['optuna_search_space']['n_estimators']),
+            'learning_rate': trial.suggest_float('learning_rate', 
+                                                 *CONFIG['optuna_search_space']['learning_rate'], 
+                                                 log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 
+                                           *CONFIG['optuna_search_space']['num_leaves']),
+            'min_child_samples': trial.suggest_int('min_child_samples', 
+                                                   *CONFIG['optuna_search_space']['min_child_samples']),
+            'subsample': trial.suggest_float('subsample', 
+                                            *CONFIG['optuna_search_space']['subsample']),
+            'colsample_bytree': trial.suggest_float('colsample_bytree', 
+                                                    *CONFIG['optuna_search_space']['colsample_bytree']),
+            'reg_alpha': trial.suggest_float('reg_alpha', 
+                                            *CONFIG['optuna_search_space']['reg_alpha']),
+            'reg_lambda': trial.suggest_float('reg_lambda', 
+                                             *CONFIG['optuna_search_space']['reg_lambda']),
+            'max_depth': trial.suggest_int('max_depth', 
+                                          *CONFIG['optuna_search_space']['max_depth']),
+            'min_gain_to_split': trial.suggest_float('min_gain_to_split', 
+                                                     *CONFIG['optuna_search_space']['min_gain_to_split']),
+            'min_child_weight': trial.suggest_float('min_child_weight', 
+                                                   *CONFIG['optuna_search_space']['min_child_weight'], 
+                                                   log=True),
+            'random_state': 42,
+            'n_jobs': -1
+        }
+        
+        model = lgb.LGBMRegressor(**params)
+        model.fit(X_train, y_train, eval_set=[(X_val, y_val)],
+                 callbacks=[lgb.early_stopping(20, verbose=False), 
+                           lgb.log_evaluation(period=0)])
+        preds = model.predict(X_val)
+        return mean_absolute_error(y_val, preds)
+    
+    study = optuna.create_study(direction='minimize', 
+                                sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    
+    print(f"      Best MAE: {study.best_value:.6f}")
+    print(f"      Best params: n_estimators={study.best_params['n_estimators']}, "
+          f"lr={study.best_params['learning_rate']:.4f}, "
+          f"num_leaves={study.best_params['num_leaves']}")
+    
+    return study.best_params
+
+# ==========================================
+# EVALUATION
+# ==========================================
+class WaveEvaluator:
+    def __init__(self, results_df, baseline_results=None, forecast_horizon=24):
+        self.df = results_df.copy()
+        self.y_true = self.df['y_true'].values
+        self.q05 = self.df['q05'].values
+        self.q50 = self.df['q50'].values
+        self.q95 = self.df['q95'].values
+        self.baseline_results = baseline_results or {}
+        self.forecast_horizon = forecast_horizon
+    
+    def generate_report(self):
+        print(THESIS_OBJECTIVES)
+        
+        print("\n" + "="*80)
+        print(f"  FORECASTING {self.forecast_horizon}H AHEAD - ENHANCED FEATURES")
+        print("="*80)
+        
+        mae = mean_absolute_error(self.y_true, self.q50)
+        rmse = np.sqrt(mean_squared_error(self.y_true, self.q50))
+        r2 = r2_score(self.y_true, self.q50)
+        
+        print(f"\nLightGBM Performance (Enhanced Features, {self.forecast_horizon}h ahead):")
+        print(f"  • MAE:  {mae:.6f}")
+        print(f"  • RMSE: {rmse:.6f}")
+        print(f"  • R²:   {r2:.4f}")
+        print(f"  • Mean Predicted: {np.mean(self.q50):.6f}")
+        print(f"  • Mean Actual:    {np.mean(self.y_true):.6f}")
+        print(f"  • Std Predicted:  {np.std(self.q50):.6f}")
+        print(f"  • Std Actual:     {np.std(self.y_true):.6f}")
+        
+        if self.baseline_results:
+            print(f"\n{'Model':<25} {'MAE':<12} {'RMSE':<12} {'R²':<10} {'DM p-val':<12} {'Result':<15}")
+            print("-" * 90)
+            
+            model_errors = np.abs(self.y_true - self.q50)
+            
+            for name, preds in self.baseline_results.items():
+                if np.any(np.isnan(preds)) or np.any(np.isinf(preds)):
+                    print(f"{name:<25} {'FAILED':<12} {'FAILED':<12} {'N/A':<10} {'N/A':<12} {'✗ Unusable':<15}")
+                    continue
+                
+                baseline_mae = mean_absolute_error(self.y_true, preds)
+                baseline_rmse = np.sqrt(mean_squared_error(self.y_true, preds))
+                baseline_r2 = r2_score(self.y_true, preds)
+                baseline_errors = np.abs(self.y_true - preds)
+                
+                dm_test = StatisticalTests.diebold_mariano_test(model_errors, baseline_errors, h=1)
+                
+                if dm_test['p_value'] < 0.05 and dm_test['better']:
+                    result = "✓ LightGBM Better"
+                elif dm_test['p_value'] < 0.05 and not dm_test['better']:
+                    result = "✗ Baseline Better"
+                else:
+                    result = "○ No Difference"
+                
+                print(f"{name:<25} {baseline_mae:<12.6f} {baseline_rmse:<12.6f} "
+                      f"{baseline_r2:<10.4f} {dm_test['p_value']:<12.4f} {result:<15}")
+        
+        print("\n" + "="*80)
+        print("UNCERTAINTY QUANTIFICATION (90% PREDICTION INTERVALS)")
+        print("="*80)
+        
+        picp = StatisticalTests.calculate_picp(self.y_true, self.q05, self.q95)
+        mpiw = StatisticalTests.calculate_mpiw(self.q05, self.q95)
+        
+        print(f"\nPrediction Intervals (90% target, using Q5-Q95):")
+        print(f"  • Coverage (PICP): {picp:.4f} ({'✓ Good' if abs(picp - 0.9) < 0.05 else '⚠ Check'})")
+        print(f"  • Avg Width:       {mpiw:.6f}")
+        print(f"  • Width Range:     [{np.min(self.q95 - self.q05):.6f}, {np.max(self.q95 - self.q05):.6f}]")
+        
+        print("\n" + "="*80)
+
+# ==========================================
+# VISUALIZATION
+# ==========================================
+def plot_wave_results(res_df, baseline_results, forecast_horizon):
+    """Enhanced visualizations"""
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    
+    y_true = res_df['y_true'].values
+    q05 = res_df['q05'].values
+    q50 = res_df['q50'].values
+    q95 = res_df['q95'].values
+    
+    subset_idx = max(0, len(res_df) - 336)
+    subset = res_df.iloc[subset_idx:]
+    x_axis = range(len(subset))
+    
+    axes[0,0].plot(x_axis, subset['y_true'].values, label='Actual Wave', 
+                   color='black', alpha=0.8, linewidth=1.5)
+    axes[0,0].plot(x_axis, subset['q50'].values, label=f'Forecast ({forecast_horizon}h ahead)', 
+                   color='blue', linestyle='--', linewidth=1.5)
+    axes[0,0].fill_between(x_axis, subset['q05'].values, subset['q95'].values,
+                            color='blue', alpha=0.2, label='90% PI (Q5-Q95)')
+    axes[0,0].set_title(f"A. {forecast_horizon}h Ahead Forecast (Last 2 Weeks)", fontweight='bold')
+    axes[0,0].set_xlabel("Hours")
+    axes[0,0].set_ylabel("Wave Value")
+    axes[0,0].legend()
+    axes[0,0].grid(alpha=0.3)
+    axes[0,0].axhline(y=0, color='gray', linestyle=':', linewidth=1)
+    
+    if baseline_results:
+        model_names = ['LightGBM'] + list(baseline_results.keys())
+        maes = [mean_absolute_error(y_true, q50)]
+        for preds in baseline_results.values():
+            if not np.any(np.isnan(preds)):
+                maes.append(mean_absolute_error(y_true, preds))
+            else:
+                maes.append(np.nan)
+        
+        valid_idx = [i for i, mae in enumerate(maes) if not np.isnan(mae)]
+        valid_names = [model_names[i] for i in valid_idx]
+        valid_maes = [maes[i] for i in valid_idx]
+        
+        colors = ['green' if mae == min(valid_maes) else 'steelblue' for mae in valid_maes]
+        axes[0,1].bar(range(len(valid_names)), valid_maes, color=colors, alpha=0.7, edgecolor='black')
+        axes[0,1].set_xticks(range(len(valid_names)))
+        axes[0,1].set_xticklabels(valid_names, rotation=45, ha='right')
+        axes[0,1].set_title("B. MAE Comparison", fontweight='bold')
+        axes[0,1].set_ylabel("MAE")
+        axes[0,1].grid(alpha=0.3, axis='y')
+    
+    residuals = y_true - q50
+    axes[0,2].hist(residuals, bins=50, density=True, alpha=0.7, color='steelblue', edgecolor='black')
+    axes[0,2].axvline(0, color='red', linestyle='--', linewidth=2)
+    mu, sigma = np.mean(residuals), np.std(residuals)
+    x = np.linspace(residuals.min(), residuals.max(), 100)
+    axes[0,2].plot(x, stats.norm.pdf(x, mu, sigma), 'r-', linewidth=2, label='Normal')
+    axes[0,2].set_title("C. Forecast Error Distribution", fontweight='bold')
+    axes[0,2].set_xlabel("Error")
+    axes[0,2].legend()
+    axes[0,2].grid(alpha=0.3)
+    
+    axes[1,0].scatter(y_true, q50, alpha=0.3, s=10)
+    axes[1,0].plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()],
+                   'r--', linewidth=2, label='Perfect')
+    axes[1,0].set_title("D. Actual vs Predicted", fontweight='bold')
+    axes[1,0].set_xlabel("Actual Wave")
+    axes[1,0].set_ylabel("Predicted Wave")
+    axes[1,0].legend()
+    axes[1,0].grid(alpha=0.3)
+    axes[1,0].axhline(y=0, color='gray', linestyle=':', linewidth=1)
+    axes[1,0].axvline(x=0, color='gray', linestyle=':', linewidth=1)
+    
+    inside = ((y_true >= q05) & (y_true <= q95)).astype(int)
+    rolling_coverage = pd.Series(inside).rolling(168).mean()
+    
+    axes[1,1].plot(rolling_coverage, alpha=0.8, linewidth=1.5, color='purple')
+    axes[1,1].axhline(y=0.90, color='red', linestyle='--', linewidth=2, label='Target 90%')
+    axes[1,1].set_title("E. Rolling Coverage (Weekly)", fontweight='bold')
+    axes[1,1].set_xlabel("Hours")
+    axes[1,1].set_ylabel("Coverage")
+    axes[1,1].legend()
+    axes[1,1].grid(alpha=0.3)
+    
+    width = q95 - q05
+    axes[1,2].hist(width, bins=40, alpha=0.7, color='teal', edgecolor='black')
+    axes[1,2].axvline(np.median(width), color='red', linestyle='--', linewidth=2,
+                      label=f'Median: {np.median(width):.6f}')
+    axes[1,2].set_title("F. Prediction Interval Width", fontweight='bold')
+    axes[1,2].set_xlabel("Width")
+    axes[1,2].legend()
+    axes[1,2].grid(alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('wave_forecast_enhanced.png', dpi=300, bbox_inches='tight')
+    print("\n📊 Plots saved: wave_forecast_enhanced.png")
+    plt.close()
+
+# ==========================================
+# MAIN PIPELINE - ENHANCED VERSION
+# ==========================================
+def run_wave_pipeline():
+    print("="*80)
+    print("  ENHANCED: WAVE FORECASTING WITH ACCELERATION & OPTUNA")
+    print("="*80)
+    print(f"\n⚙️  Configuration:")
+    print(f"   • Forecast horizon: {CONFIG['forecast_horizon']} hours")
+    print(f"   • Quantiles: {CONFIG['quantiles']} (90% PI)")
+    print(f"   • Training window: {CONFIG['rolling_window_size']} hours")
+    print(f"   • Test window: {CONFIG['test_window_size']} hours")
+    print(f"   • Optuna trials: {CONFIG['optuna_trials']}")
+    print(f"   • Retune frequency: Every {CONFIG['retune_frequency']} steps")
+    
+    # Load data
+    print(f"\n Loading data...")
+    try:
+        ohlcv_df = pd.read_csv(CONFIG['ohlcv_file'])
+        print(f"   ✓ OHLCV data loaded: {len(ohlcv_df)} rows")
+    except FileNotFoundError:
+        print(f"\n  OHLCV file not found: {CONFIG['ohlcv_file']}")
+        return
+    
+    try:
+        wave_df = pd.read_csv(CONFIG['wave_target_file'])
+        print(f"   ✓ Wave target data loaded: {len(wave_df)} rows")
+    except FileNotFoundError:
+        print(f"\n  Wave target file not found: {CONFIG['wave_target_file']}")
+        return
+    
+    # Enhanced feature engineering
+    print("\n🔧 Engineering ENHANCED OHLCV features...")
+    ohlcv_eng, features = engineer_ohlcv_features_enhanced(ohlcv_df)
+    
+    # Merge
+    print(f"\n🔗 Merging features with FUTURE wave target...")
+    merged_df, target_col = merge_ohlcv_wave_target_no_leakage(
+        ohlcv_eng, wave_df, CONFIG['forecast_horizon']
+    )
+    
+    merged_df.dropna(subset=features + [target_col], inplace=True)
+    merged_df.reset_index(drop=True, inplace=True)
+    print(f"   ✓ Final dataset: {len(merged_df)} valid samples")
+    
+    print(f"\n   Wave Target Statistics:")
+    print(f"   • Mean: {merged_df[target_col].mean():.6f}")
+    print(f"   • Std: {merged_df[target_col].std():.6f}")
+    print(f"   • Range: [{merged_df[target_col].min():.6f}, {merged_df[target_col].max():.6f}]")
+    
+    # Rolling validation
+    print(f"\n Rolling Window Validation with Optuna:")
+    
+    predictions = []
+    baseline_predictions = {
+        'Random Walk': [],
+        'Historical Mean': [],
+        'Last Value': [],
+        'Ridge Regression': [],
+        'Random Forest': []
+    }
+    
+    rolling_size = CONFIG['rolling_window_size']
+    step = CONFIG['step_size']
+    test_size = CONFIG['test_window_size']
+    best_params = None
+    
+    total_steps = (len(merged_df) - rolling_size - test_size) // step + 1
+    step_count = 0
+    curr_start = 0
+    
+    print(f"   • Total rolling windows: {total_steps}")
+    
+    while curr_start + rolling_size + test_size <= len(merged_df):
+        train_start = curr_start
+        train_end = curr_start + rolling_size
+        test_end = min(train_end + test_size, len(merged_df))
+        
+        train_df = merged_df.iloc[train_start:train_end]
+        test_df = merged_df.iloc[train_end:test_end]
+        
+        if len(test_df) == 0:
+            break
+        
+        X_train = train_df[features].values
+        y_train = train_df[target_col].values
+        X_test = test_df[features].values
+        y_test = test_df[target_col].values
+        
+        scaler = RobustScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
+        
+        # Optuna tuning
+        if CONFIG['use_optuna'] and (step_count % CONFIG['retune_frequency'] == 0):
+            print(f"\n    Optuna tuning at step {step_count+1}/{total_steps}...")
+            best_params = tune_hyperparameters_optuna(
+                X_train_s, y_train, n_trials=CONFIG['optuna_trials']
+            )
+        elif not CONFIG['use_optuna'] and step_count == 0:
+            best_params = CONFIG['fixed_params'].copy()
+        
+        # Train quantile models
+        q_preds = []
+        for q in CONFIG['quantiles']:
+            params = best_params.copy() if best_params else CONFIG['fixed_params'].copy()
+            params.update({
+                'objective': 'quantile',
+                'alpha': q,
+                'metric': 'quantile',
+                'boosting_type': 'gbdt',
+                'verbosity': -1
+            })
+            
+            model = lgb.LGBMRegressor(**params)
+            model.fit(X_train_s, y_train, callbacks=[lgb.log_evaluation(period=0)])
+            q_preds.append(model.predict(X_test_s))
+        
+        q_preds = np.array(q_preds).T
+        q_preds = np.sort(q_preds, axis=1)
+        
+        # Baselines
+        n_test = len(y_test)
+        baseline_predictions['Random Walk'].extend(WaveBaselines.random_walk(n_test))
+        baseline_predictions['Historical Mean'].extend(WaveBaselines.historical_mean(y_train, n_test))
+        baseline_predictions['Last Value'].extend(WaveBaselines.last_value(y_train, n_test))
+        baseline_predictions['Ridge Regression'].extend(WaveBaselines.train_ridge(X_train_s, y_train, X_test_s))
+        baseline_predictions['Random Forest'].extend(WaveBaselines.train_random_forest(X_train_s, y_train, X_test_s))
+        
+        dates = test_df['Date'].values
+        for i in range(len(dates)):
+            predictions.append({
+                'Date': dates[i],
+                'y_true': y_test[i],
+                'q05': q_preds[i, 0],
+                'q50': q_preds[i, 1],
+                'q95': q_preds[i, 2],
+                'window': step_count
+            })
+        
+        curr_start += step
+        step_count += 1
+        progress = (step_count / total_steps) * 100
+        sys.stdout.write(f"\r   ⏳ Progress: {progress:.1f}% [{step_count}/{total_steps}]")
+        sys.stdout.flush()
+    
+    print("\n\n✓ Predictions complete!")
+    
+    res_df = pd.DataFrame(predictions)
+    baseline_results = {name: np.array(preds) for name, preds in baseline_predictions.items()
+                       if len(preds) == len(res_df)}
+    
+    print(f"\n Quick Summary:")
+    print(f"   • Total predictions: {len(res_df)}")
+    print(f"   • MAE: {mean_absolute_error(res_df['y_true'], res_df['q50']):.6f}")
+    print(f"   • R²: {r2_score(res_df['y_true'], res_df['q50']):.4f}")
+    print(f"   • Coverage: {np.mean((res_df['y_true'] >= res_df['q05']) & (res_df['y_true'] <= res_df['q95'])):.4f}")
+    
+    evaluator = WaveEvaluator(res_df, baseline_results, CONFIG['forecast_horizon'])
+    evaluator.generate_report()
+    
+    plot_wave_results(res_df, baseline_results, CONFIG['forecast_horizon'])
+    
+    res_df.to_csv('wave_predictions_enhanced.csv', index=False)
+    if baseline_results:
+        baseline_df = pd.DataFrame({'Date': res_df['Date'], 'y_true': res_df['y_true'], **baseline_results})
+        baseline_df.to_csv('wave_baselines_enhanced.csv', index=False)
+    
+    print("\n✓ Results saved:")
+    print("   • wave_predictions_enhanced.csv")
+    print("   • wave_baselines_enhanced.csv")
+    print("   • wave_forecast_enhanced.png")
+    
+    # Feature importance
+    print("\n Extracting feature importance...")
+    X_sample = merged_df[features].iloc[-rolling_size:].values
+    y_sample = merged_df[target_col].iloc[-rolling_size:].values
+    scaler_sample = RobustScaler()
+    X_sample_s = scaler_sample.fit_transform(X_sample)
+    
+    params = best_params.copy() if best_params else CONFIG['fixed_params'].copy()
+    params.update({'objective': 'regression', 'metric': 'rmse', 'verbosity': -1})
+    model_importance = lgb.LGBMRegressor(**params)
+    model_importance.fit(X_sample_s, y_sample, callbacks=[lgb.log_evaluation(period=0)])
+    
+    importance_df = pd.DataFrame({
+        'Feature': features,
+        'Importance': model_importance.feature_importances_
+    }).sort_values('Importance', ascending=False)
+    
+    importance_df.to_csv('feature_importance_enhanced.csv', index=False)
+    
+    print("\nTop 20 Most Important Features:")
+    for idx, row in importance_df.head(20).iterrows():
+        print(f"   {row['Feature']:<40} {row['Importance']:>10.1f}")
+    
+    print("\n" + "="*80)
+    print("✓ ENHANCED WAVE FORECASTING COMPLETE!")
+    print("="*80)
+
+if __name__ == "__main__":
+    run_wave_pipeline()
