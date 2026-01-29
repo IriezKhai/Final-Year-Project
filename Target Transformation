@@ -1,0 +1,117 @@
+import pandas as pd
+import numpy as np
+from scipy.special import gamma
+
+def get_weights(d, size):
+    """
+    Calculate weights for fractional differentiation.
+
+    Args:
+        d: Differentiation order (typically between 0 and 1)
+        size: Number of weights to calculate
+
+    Returns:
+        Array of weights
+    """
+    w = [1.0]
+    for k in range(1, size):
+        w.append(-w[-1] * (d - k + 1) / k)
+    return np.array(w)
+
+def frac_diff(series, d, threshold=1e-5):
+    """
+    Apply fractional differentiation to a time series.
+
+    Args:
+        series: Input time series (pandas Series)
+        d: Differentiation order (0 < d < 1)
+        threshold: Minimum weight threshold to reduce computation
+
+    Returns:
+        Fractionally differentiated series
+    """
+    # Calculate weights
+    weights = get_weights(d, len(series))
+
+    # Keep only weights above threshold
+    weights = weights[np.abs(weights) > threshold]
+
+    # Apply fractional differentiation
+    result = pd.Series(index=series.index, dtype=float)
+
+    for i in range(len(weights), len(series)):
+        result.iloc[i] = np.dot(weights, series.iloc[i-len(weights):i][::-1])
+
+    return result
+
+def ohlcv_to_fracdiff(input_file, output_file, d=0.5, price_col='Close', threshold=1e-5):
+    """
+    Transform OHLCV data to Fractionally Differentiated Pricing.
+
+    Args:
+        input_file: Path to input CSV file with OHLCV data
+        output_file: Path to output CSV file
+        d: Differentiation order (default 0.5, range 0-1)
+        price_col: Column to use for pricing ('Close', 'Open', 'High', 'Low', or 'Avg')
+        threshold: Minimum weight threshold
+    """
+    # Read OHLCV data
+    df = pd.read_csv(input_file)
+
+    # Ensure Date column exists
+    if 'Date' not in df.columns:
+        raise ValueError("Input CSV must have a 'Date' column")
+
+    # Determine which price to use
+    if price_col == 'Avg':
+        # Use average of OHLC
+        price_series = df[['Open', 'High', 'Low', 'Close']].mean(axis=1)
+    elif price_col in df.columns:
+        price_series = df[price_col]
+    else:
+        raise ValueError(f"Column '{price_col}' not found in input file")
+
+    # Apply fractional differentiation
+    fracdiff_prices = frac_diff(price_series, d, threshold)
+
+    # Create output dataframe
+    output_df = pd.DataFrame({
+        'Date': df['Date'],
+        'Price': fracdiff_prices
+    })
+
+    # Remove NaN values (from initial periods where weights couldn't be applied)
+    output_df = output_df.dropna()
+
+    # Save to CSV
+    output_df.to_csv(output_file, index=False)
+
+    print(f"Fractional differentiation completed!")
+    print(f"Differentiation order (d): {d}")
+    print(f"Input rows: {len(df)}")
+    print(f"Output rows: {len(output_df)}")
+    print(f"Saved to: {output_file}")
+
+    return output_df
+
+# Example usage
+if __name__ == "__main__":
+    # Example: Transform OHLCV data with d=0.5 (preserves more memory)
+    # Higher d (closer to 1) = more differentiation = more stationarity, less memory
+    # Lower d (closer to 0) = less differentiation = less stationarity, more memory
+
+    input_csv = "prototypedata.csv"  # Your input file
+    output_csv = "fracdiff_prices.csv"  # Output file
+
+    # Transform using Close price with d=0.5
+    df_result = ohlcv_to_fracdiff(
+        input_file=input_csv,
+        output_file=output_csv,
+        d=0.5,  # Adjust between 0 and 1 for desired stationarity
+        price_col='Close'  # Options: 'Close', 'Open', 'High', 'Low', 'Avg'
+    )
+
+    print("\nFirst few rows of output:")
+    print(df_result.head())
+    print("\nStatistics:")
+    print(df_result['Price'].describe())
