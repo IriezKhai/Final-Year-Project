@@ -1,0 +1,82 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+
+# 1. Load the dataset
+df = pd.read_csv('wave_predictions_no_leakage.csv')
+df['Date'] = pd.to_datetime(df['Date'])
+
+# 2. Select a representative window
+# We start at index 1000 and take 100 hours to show clear wave structure
+start_idx = 1000
+window_size = 100
+subset = df.iloc[start_idx:start_idx+window_size].copy()
+
+# 3. Define the Base Signal and Calculate Derivatives
+signal = subset['y_true'].values
+# First Derivative (Velocity) - d=1
+velocity = np.diff(signal, prepend=signal[0])
+# Second Derivative (Acceleration) - d=2
+acceleration = np.diff(velocity, prepend=velocity[0])
+# Third Derivative (Jerk) - d=3
+jerk = np.diff(acceleration, prepend=acceleration[0])
+
+# 4. Define Roughness Metric (Noise Quantification)
+# Formula: Sum of Absolute Differences / Range
+def calculate_roughness(series):
+    return np.sum(np.abs(np.diff(series))) / (np.max(series) - np.min(series))
+
+r_signal = calculate_roughness(signal)
+r_vel = calculate_roughness(velocity)
+r_acc = calculate_roughness(acceleration)
+r_jerk = calculate_roughness(jerk)
+
+# 5. Standardize Data for Comparison (Z-Score)
+# This ensures all lines fit on the same y-axis scale
+scaler = StandardScaler()
+norm_signal = scaler.fit_transform(signal.reshape(-1, 1)).flatten()
+norm_vel = scaler.fit_transform(velocity.reshape(-1, 1)).flatten()
+norm_acc = scaler.fit_transform(acceleration.reshape(-1, 1)).flatten()
+norm_jerk = scaler.fit_transform(jerk.reshape(-1, 1)).flatten()
+
+# 6. Plotting
+plt.figure(figsize=(14, 8))
+
+# Plot Base Signal
+plt.plot(subset['Date'], norm_signal,
+         label=f'Signal (Base) | Roughness: {r_signal:.2f}',
+         linewidth=2.5, color='black')
+
+# Plot Velocity
+plt.plot(subset['Date'], norm_vel,
+         label=f'Velocity (d=1) | Roughness: {r_vel:.2f}',
+         linewidth=1.5, alpha=0.8)
+
+# Plot Acceleration
+plt.plot(subset['Date'], norm_acc,
+         label=f'Acceleration (d=2) | Roughness: {r_acc:.2f}',
+         linewidth=1.0, alpha=0.7, linestyle='--')
+
+# Plot Jerk
+plt.plot(subset['Date'], norm_jerk,
+         label=f'Jerk (d=3) | Roughness: {r_jerk:.2f}',
+         linewidth=0.8, alpha=0.6, linestyle=':')
+
+# Formatting
+plt.title('Signal Degradation & Noise Amplification in Kinematic Features')
+plt.ylabel('Standardized Magnitude (Z-Score)')
+plt.xlabel('Date')
+plt.legend(loc='upper left', frameon=True, title='Feature (Differentiation Order)')
+plt.grid(True, alpha=0.3)
+
+# Save and Show
+plt.savefig('kinematic_signal_degradation.png')
+plt.show()
+
+# Print Metrics
+print("Roughness Metrics:")
+print(f"Signal: {r_signal}")
+print(f"Velocity: {r_vel}")
+print(f"Acceleration: {r_acc}")
+print(f"Jerk: {r_jerk}")
