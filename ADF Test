@@ -1,0 +1,72 @@
+import pandas as pd
+import numpy as np  #
+from statsmodels.tsa.stattools import adfuller
+
+# ---------------------------------------------------------
+# 1. Load Your Data
+# ---------------------------------------------------------
+# Replace 'your_data.csv' with your actual file name
+# Ensure your CSV has a column named 'Close'
+file_path = 'prototypedata.csv'
+
+try:
+    df = pd.read_csv(file_path)
+    print(f"✅ Successfully loaded {len(df)} rows from {file_path}")
+except FileNotFoundError:
+    print("❌ File not found. Creating dummy data for demonstration...")
+    # Creating dummy data just so the code runs if you copy-paste it now
+    import numpy as np
+    dates = pd.date_range(start='2020-01-01', periods=1000, freq='H')
+    prices = 100 + np.cumsum(np.random.randn(1000)) # Random Walk (Non-Stationary)
+    df = pd.DataFrame({'Date': dates, 'Close': prices})
+
+# ---------------------------------------------------------
+# 2. Define the ADF Test Function
+# ---------------------------------------------------------
+def test_raw_price_stationarity(series):
+    print("\n" + "="*50)
+    print(f"📊 AUGMENTED DICKEY-FULLER TEST RESULTS")
+    print(f"   Target: Raw Close Price (d=0)")
+    print("="*50)
+
+    # Run the test
+    # autolag='AIC' automatically chooses the best lag length
+    result = adfuller(series, autolag='AIC')
+
+    # Extract results
+    adf_stat = result[0]
+    p_value = result[1]
+    used_lag = result[2]
+    n_obs = result[3]
+    critical_values = result[4]
+
+    # Print Metrics
+    print(f"ADF Statistic:  {adf_stat:.4f}")
+    print(f"p-value:        {p_value:.4f}")
+    print(f"Lags Used:      {used_lag}")
+    print(f"Observations:   {n_obs}")
+    print("-" * 30)
+    print("Critical Values:")
+    for key, value in critical_values.items():
+        print(f"   {key:>4}: {value:.4f}")
+    print("-" * 30)
+
+    # Interpretation Logic
+    print("\n🔍 INTERPRETATION:")
+    if p_value < 0.05:
+        print("✅ The p-value is less than 0.05.")
+        print("   Result: The Raw Price is STATIONARY.")
+        print("   (This is extremely rare for raw financial data).")
+    else:
+        print(f"❌ The p-value is {p_value:.4f} (>= 0.05).")
+        print("   Result: The Raw Price is NON-STATIONARY.")
+        print("   Meaning: It has a Unit Root (Trend). You CANNOT use this for ML directly.")
+        print("   Solution: This confirms why you need Fractional Differentiation.")
+
+# ---------------------------------------------------------
+# 3. Run the Test
+# ---------------------------------------------------------
+# Ensure there are no missing values (NaN) or infinity values
+clean_series = df['Close'].replace([np.inf, -np.inf], np.nan).dropna()
+
+test_raw_price_stationarity(clean_series)
