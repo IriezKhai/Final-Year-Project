@@ -1,0 +1,54 @@
+# --- Forex Daily Data Cleaning + Line Chart Visualization (USD/JPY) ---
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+file_path = 'NZ.csv'
+df = pd.read_csv(file_path, header=None)
+
+print("Before Cleaning:")
+display(df.head())
+
+df.columns = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume']
+
+
+df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+
+# Drop rows with invalid or missing dates
+df = df.dropna(subset=['Date'])
+
+# Step 6: Convert price columns to numeric (important fix)
+cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
+
+# Drop rows where prices are invalid
+df = df.dropna(subset=cols)
+
+df = df.sort_values(by='Date').reset_index(drop=True)
+
+df = df.ffill()
+
+df['DateTime'] = df['Date']
+
+df = df.set_index('DateTime')
+
+plt.figure(figsize=(12, 6))
+plt.plot(df['Close'], label='Close', linewidth=1.2)
+
+cleaned_path = 'NZC.csv'
+df.to_csv(cleaned_path, index=False)
+print(f" Cleaned data saved to {cleaned_path}")
+
+# plt.plot(df['Open'], label='Open', alpha=0.7)
+# plt.plot(df['High'], label='High', alpha=0.7)
+# plt.plot(df['Low'], label='Low', alpha=0.7)
+
+# Chart formatting
+plt.title('USD/JPY Hourly Data — Close Price Over Time', fontsize=14)
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Price (USD/JPY)', fontsize=12)
+plt.legend()
+plt.grid(True, linestyle='--', alpha=0.5)
+
+plt.tight_layout()
+plt.show()
