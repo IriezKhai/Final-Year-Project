@@ -1,0 +1,53 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# 1. Load the Data
+df = pd.read_csv('wave_predictions_no_leakage.csv')
+df['Date'] = pd.to_datetime(df['Date'])
+
+# 2. Calculate the "Anchor" Features (Moving Averages)
+# The thesis identifies these as the top predictive memory features
+df['MA_336h'] = df['y_true'].rolling(window=336).mean()  # 2-Week Anchor
+df['MA_720h'] = df['y_true'].rolling(window=720).mean()  # 1-Month Anchor
+
+# 3. Select a Representative Window (Longer window to show cyclicality)
+# We choose a 2000-hour window (approx 3 months) to visualize the mean reversion
+start_idx = 5000
+window_len = 2000
+subset = df.iloc[start_idx : start_idx + window_len].copy()
+
+# 4. Plotting
+fig, ax = plt.subplots(figsize=(14, 7))
+
+# Plot the Actual Price Wave (Target)
+sns.lineplot(data=subset, x='Date', y='y_true', label='Actual Wave (Price)',
+             color='black', alpha=0.3, linewidth=1, ax=ax)
+
+# Plot the 2-Week Anchor (Smart Money Cycle)
+sns.lineplot(data=subset, x='Date', y='MA_336h', label='2-Week Moving Average (336h)',
+             color='blue', linewidth=2, ax=ax)
+
+# Plot the 1-Month Anchor (Structural Mean)
+sns.lineplot(data=subset, x='Date', y='MA_720h', label='1-Month Moving Average (720h)',
+             color='red', linestyle='--', linewidth=2, ax=ax)
+
+# Formatting
+ax.set_title('Discussion 7.4.3: Structural Memory & Mean Reversion to Long-Term Anchors')
+ax.set_ylabel('Fractionally Differentiated Value')
+ax.set_xlabel('Date')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# Highlight Mean Reversion events (Optional visual cues)
+# This code fills the area between price and the monthly mean to visualize "Distance"
+ax.fill_between(subset['Date'], subset['y_true'], subset['MA_720h'],
+                where=(subset['y_true'] > subset['MA_720h']),
+                color='green', alpha=0.1, interpolate=True, label='Positive Deviation')
+ax.fill_between(subset['Date'], subset['y_true'], subset['MA_720h'],
+                where=(subset['y_true'] < subset['MA_720h']),
+                color='red', alpha=0.1, interpolate=True, label='Negative Deviation')
+
+plt.tight_layout()
+plt.savefig('structural_memory_anchors.png')
+plt.show()
